@@ -1,5 +1,6 @@
 """Oracle Cloud Infrastructure (OCI) client for Cohere API."""
 
+import configparser
 import email.utils
 import json
 import os
@@ -206,9 +207,50 @@ def _load_oci_config(
 
     else:
         # Load from config file
-        return oci.config.from_file(
+        oci_config = oci.config.from_file(
             file_location=config_path or "~/.oci/config", profile_name=profile or "DEFAULT"
         )
+        _remove_inherited_session_auth(oci_config, config_path=config_path, profile=profile)
+        return oci_config
+
+
+def _remove_inherited_session_auth(
+    oci_config: typing.Dict[str, typing.Any],
+    *,
+    config_path: typing.Optional[str],
+    profile: typing.Optional[str],
+) -> None:
+    """Drop session auth fields inherited from the OCI config DEFAULT section."""
+    profile_name = profile or "DEFAULT"
+    if profile_name == "DEFAULT" or "security_token_file" not in oci_config:
+        return
+
+    parser = configparser.ConfigParser(interpolation=None)
+    if not parser.read(os.path.expanduser(config_path or "~/.oci/config")):
+        return
+
+    explicit_profile = parser._sections.get(profile_name, {})
+    if "security_token_file" not in explicit_profile:
+        oci_config.pop("security_token_file", None)
+
+
+def _usage_from_oci(usage_data: typing.Optional[typing.Dict[str, typing.Any]]) -> typing.Dict[str, typing.Any]:
+    usage_data = usage_data or {}
+    input_tokens = usage_data.get("inputTokens", 0)
+    output_tokens = usage_data.get("completionTokens", usage_data.get("outputTokens", 0))
+
+    usage: typing.Dict[str, typing.Any] = {
+        "tokens": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+    }
+    if input_tokens or output_tokens:
+        usage["billed_units"] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+    return usage
 
 
 def get_event_hooks(
@@ -258,18 +300,9 @@ def map_request_to_oci(
     oci = lazy_oci()
 
     # Create OCI signer based on config type
-    # Priority order: instance/resource principal > API key auth > session-based auth
+    # Priority order: instance/resource principal > session-based auth > API key auth
     if "signer" in oci_config:
         signer = oci_config["signer"]  # Instance/resource principal
-    elif "user" in oci_config:
-        # Config has user field - standard API key auth (prioritize this over session-based)
-        signer = oci.signer.Signer(
-            tenancy=oci_config["tenancy"],
-            user=oci_config["user"],
-            fingerprint=oci_config["fingerprint"],
-            private_key_file_location=oci_config.get("key_file"),
-            private_key_content=oci_config.get("key_content"),
-        )
     elif "security_token_file" in oci_config:
         # Session-based authentication with security token (fallback if no user field)
         # Note: Session tokens expire (typically ~1 hour). If expired, re-run:
@@ -292,11 +325,19 @@ def map_request_to_oci(
                 "OCI config profile is missing 'key_file'. "
                 "Session-based auth requires a key_file entry in your OCI config profile."
             )
-        private_key = oci.signer.load_private_key_from_file(key_file)
+        private_key = oci.signer.load_private_key_from_file(os.path.expanduser(key_file))
 
         signer = oci.auth.signers.SecurityTokenSigner(
             token=security_token,
             private_key=private_key,
+        )
+    elif "user" in oci_config:
+        signer = oci.signer.Signer(
+            tenancy=oci_config["tenancy"],
+            user=oci_config["user"],
+            fingerprint=oci_config["fingerprint"],
+            private_key_file_location=oci_config.get("key_file"),
+            private_key_content=oci_config.get("key_content"),
         )
     else:
         # Config doesn't have user or security token - unsupported
@@ -319,7 +360,6 @@ def map_request_to_oci(
         url = get_oci_url(
             region=oci_region,
             endpoint=endpoint,
-            stream="stream" in endpoint or body.get("stream", False),
         )
 
         # Transform request body to OCI format
@@ -420,7 +460,6 @@ def map_response_from_oci() -> EventHook:
 def get_oci_url(
     region: str,
     endpoint: str,
-    stream: bool = False,
 ) -> str:
     """
     Map Cohere endpoints to OCI Generative AI endpoints.
@@ -428,8 +467,6 @@ def get_oci_url(
     Args:
         region: OCI region (e.g., "us-chicago-1")
         endpoint: Cohere endpoint name
-        stream: Whether this is a streaming request
-
     Returns:
         Full OCI Generative AI endpoint URL
     """
@@ -474,6 +511,9 @@ def normalize_model_for_oci(model: str) -> str:
         >>> normalize_model_for_oci("ocid1.generativeaimodel.oc1...")
         "ocid1.generativeaimodel.oc1..."
     """
+    if not model:
+        raise ValueError("OCI requests require a non-empty model name")
+
     # If it's already an OCID, return as-is (works across all regions)
     if model.startswith("ocid1."):
         return model
@@ -501,15 +541,20 @@ def transform_request_to_oci(
     Returns:
         Transformed request body in OCI format
     """
-    model = normalize_model_for_oci(cohere_body.get("model", ""))
+    model = normalize_model_for_oci(cohere_body.get("model"))
 
     if endpoint == "embed":
-        # Transform Cohere input_type to OCI format
-        # Cohere uses: "search_document", "search_query", "classification", "clustering"
-        # OCI uses: "SEARCH_DOCUMENT", "SEARCH_QUERY", "CLASSIFICATION", "CLUSTERING"
+        if "texts" in cohere_body:
+            inputs = cohere_body["texts"]
+        elif "inputs" in cohere_body:
+            inputs = cohere_body["inputs"]
+        elif "images" in cohere_body:
+            raise ValueError("OCI embed does not support the top-level 'images' parameter; use 'inputs' instead")
+        else:
+            raise ValueError("OCI embed requires either 'texts' or 'inputs'")
 
         oci_body = {
-            "inputs": cohere_body["texts"],
+            "inputs": inputs,
             "servingMode": {
                 "servingType": "ON_DEMAND",
                 "modelId": model,
@@ -526,6 +571,12 @@ def transform_request_to_oci(
 
         if "embedding_types" in cohere_body:
             oci_body["embeddingTypes"] = [et.upper() for et in cohere_body["embedding_types"]]
+        if "max_tokens" in cohere_body:
+            oci_body["maxTokens"] = cohere_body["max_tokens"]
+        if "output_dimension" in cohere_body:
+            oci_body["outputDimension"] = cohere_body["output_dimension"]
+        if "priority" in cohere_body:
+            oci_body["priority"] = cohere_body["priority"]
 
         return oci_body
 
@@ -566,6 +617,10 @@ def transform_request_to_oci(
             # Add tool_calls if present
             if "tool_calls" in msg:
                 oci_msg["toolCalls"] = msg["tool_calls"]
+            if "tool_call_id" in msg:
+                oci_msg["toolCallId"] = msg["tool_call_id"]
+            if "tool_plan" in msg:
+                oci_msg["toolPlan"] = msg["tool_plan"]
 
             oci_messages.append(oci_msg)
 
@@ -590,12 +645,22 @@ def transform_request_to_oci(
             chat_request["stopSequences"] = cohere_body["stop_sequences"]
         if "tools" in cohere_body:
             chat_request["tools"] = cohere_body["tools"]
+        if "strict_tools" in cohere_body:
+            chat_request["strictTools"] = cohere_body["strict_tools"]
         if "documents" in cohere_body:
             chat_request["documents"] = cohere_body["documents"]
         if "citation_options" in cohere_body:
             chat_request["citationOptions"] = cohere_body["citation_options"]
+        if "response_format" in cohere_body:
+            chat_request["responseFormat"] = cohere_body["response_format"]
         if "safety_mode" in cohere_body:
             chat_request["safetyMode"] = cohere_body["safety_mode"]
+        if "logprobs" in cohere_body:
+            chat_request["logprobs"] = cohere_body["logprobs"]
+        if "tool_choice" in cohere_body:
+            chat_request["toolChoice"] = cohere_body["tool_choice"]
+        if "priority" in cohere_body:
+            chat_request["priority"] = cohere_body["priority"]
         # Thinking parameter for Command A Reasoning models
         if "thinking" in cohere_body and cohere_body["thinking"] is not None:
             thinking = cohere_body["thinking"]
@@ -639,8 +704,10 @@ def transform_request_to_oci(
         # Add optional rerank parameters
         if "top_n" in cohere_body:
             oci_body["topN"] = cohere_body["top_n"]
-        if "max_chunks_per_doc" in cohere_body:
-            oci_body["maxChunksPerDocument"] = cohere_body["max_chunks_per_doc"]
+        if "max_tokens_per_doc" in cohere_body:
+            oci_body["maxTokensPerDocument"] = cohere_body["max_tokens_per_doc"]
+        if "priority" in cohere_body:
+            oci_body["priority"] = cohere_body["priority"]
 
         return oci_body
 
@@ -665,7 +732,10 @@ def transform_oci_response_to_cohere(
         embeddings_data = oci_response.get("embeddings", {})
 
         # V2 expects embeddings as a dict with type keys (float, int8, etc.)
-        embeddings = embeddings_data if isinstance(embeddings_data, dict) else {"float": embeddings_data}
+        if isinstance(embeddings_data, dict):
+            embeddings = {str(key).lower(): value for key, value in embeddings_data.items()}
+        else:
+            embeddings = {"float": embeddings_data}
 
         # Build proper meta structure
         meta = {
@@ -697,20 +767,7 @@ def transform_oci_response_to_cohere(
 
     elif endpoint in ["chat", "chat_stream"]:
         chat_response = oci_response.get("chatResponse", {})
-
-        # Extract usage
-        usage_data = chat_response.get("usage", {})
-        usage = {
-            "tokens": {
-                "input_tokens": usage_data.get("inputTokens", 0),
-                "output_tokens": usage_data.get("completionTokens", 0),
-            },
-        }
-        if usage_data.get("inputTokens") or usage_data.get("completionTokens"):
-            usage["billed_units"] = {
-                "input_tokens": usage_data.get("inputTokens", 0),
-                "output_tokens": usage_data.get("completionTokens", 0),
-            }
+        usage = _usage_from_oci(chat_response.get("usage"))
 
         # Transform message from OCI format to Cohere format
         message = chat_response.get("message", {})
@@ -737,6 +794,10 @@ def transform_oci_response_to_cohere(
             tool_calls = message["toolCalls"]
             message = {k: v for k, v in message.items() if k != "toolCalls"}
             message["tool_calls"] = tool_calls
+        if "toolPlan" in message:
+            tool_plan = message["toolPlan"]
+            message = {k: v for k, v in message.items() if k != "toolPlan"}
+            message["tool_plan"] = tool_plan
 
         return {
             "id": chat_response.get("id", str(uuid.uuid4())),
@@ -764,9 +825,7 @@ def transform_oci_response_to_cohere(
     return oci_response
 
 
-def transform_oci_stream_wrapper(
-    stream: SyncByteStream, endpoint: str
-) -> typing.Iterator[bytes]:
+def transform_oci_stream_wrapper(stream: SyncByteStream, endpoint: str) -> typing.Iterator[bytes]:
     """
     Wrap OCI stream and transform events to Cohere V2 format.
 
@@ -784,6 +843,9 @@ def transform_oci_stream_wrapper(
 
     generation_id = str(uuid.uuid4())
     emitted_start = False
+    emitted_content_end = False
+    final_finish_reason = "COMPLETE"
+    final_usage: typing.Optional[typing.Dict[str, typing.Any]] = None
     buffer = b""
     for chunk in stream:
         buffer += chunk
@@ -794,8 +856,16 @@ def transform_oci_stream_wrapper(
             if line.startswith("data: "):
                 data_str = line[6:]  # Remove "data: " prefix
                 if data_str.strip() == "[DONE]":
-                    # Emit message-end event before stopping
-                    message_end_event = {"type": "message-end"}
+                    if emitted_start and not emitted_content_end:
+                        content_end_event = {"type": "content-end", "index": 0}
+                        yield b"data: " + json.dumps(content_end_event).encode("utf-8") + b"\n\n"
+                    message_end_event: typing.Dict[str, typing.Any] = {
+                        "type": "message-end",
+                        "id": generation_id,
+                        "delta": {"finish_reason": final_finish_reason},
+                    }
+                    if final_usage:
+                        message_end_event["delta"]["usage"] = final_usage
                     yield b"data: " + json.dumps(message_end_event).encode("utf-8") + b"\n\n"
                     return
 
@@ -835,8 +905,12 @@ def transform_oci_stream_wrapper(
                         yield b"data: " + json.dumps(content_start).encode("utf-8") + b"\n\n"
                         emitted_start = True
 
-                    cohere_event = transform_stream_event(endpoint, oci_event)
-                    yield b"data: " + json.dumps(cohere_event).encode("utf-8") + b"\n\n"
+                    for cohere_event in transform_stream_event(endpoint, oci_event):
+                        if cohere_event["type"] == "content-end":
+                            emitted_content_end = True
+                            final_finish_reason = oci_event.get("finishReason", final_finish_reason)
+                            final_usage = _usage_from_oci(oci_event.get("usage"))
+                        yield b"data: " + json.dumps(cohere_event).encode("utf-8") + b"\n\n"
                 except Exception as e:
                     raise RuntimeError(
                         f"OCI stream event transformation failed for endpoint '{endpoint}': {e}"
@@ -845,7 +919,7 @@ def transform_oci_stream_wrapper(
 
 def transform_stream_event(
     endpoint: str, oci_event: typing.Dict[str, typing.Any]
-) -> typing.Dict[str, typing.Any]:
+) -> typing.List[typing.Dict[str, typing.Any]]:
     """
     Transform individual OCI stream event to Cohere V2 format.
 
@@ -875,30 +949,34 @@ def transform_stream_event(
                     content_type = "text"
                     content_value = first_content.get("text", "")
 
-        is_finished = "finishReason" in oci_event
-
-        if is_finished:
-            # Final event - use content-end type
-            return {
-                "type": "content-end",
-                "index": 0,
-            }
-        else:
-            # Content delta event - include type for thinking vs text
+        events: typing.List[typing.Dict[str, typing.Any]] = []
+        if content_value:
             delta_content: typing.Dict[str, typing.Any] = {}
             if content_type == "thinking":
                 delta_content["thinking"] = content_value
             else:
                 delta_content["text"] = content_value
 
-            return {
-                "type": "content-delta",
-                "index": 0,
-                "delta": {
-                    "message": {
-                        "content": delta_content,
+            events.append(
+                {
+                    "type": "content-delta",
+                    "index": 0,
+                    "delta": {
+                        "message": {
+                            "content": delta_content,
+                        }
                     }
-                },
-            }
+                }
+            )
 
-    return oci_event
+        if "finishReason" in oci_event:
+            events.append(
+                {
+                    "type": "content-end",
+                    "index": 0,
+                }
+            )
+
+        return events
+
+    return [oci_event]
