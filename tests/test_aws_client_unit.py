@@ -10,12 +10,26 @@ Covers:
 import inspect
 import json
 import os
+import sys
+import types
 import unittest
 from unittest.mock import MagicMock, patch
 
 import httpx
 
 from cohere.manually_maintained.cohere_aws.mode import Mode
+
+if "tokenizers" not in sys.modules:
+    tokenizers_stub = types.ModuleType("tokenizers")
+    tokenizers_stub.Tokenizer = object
+    sys.modules["tokenizers"] = tokenizers_stub
+
+if "fastavro" not in sys.modules:
+    fastavro_stub = types.ModuleType("fastavro")
+    fastavro_stub.parse_schema = lambda schema: schema
+    fastavro_stub.reader = lambda *args, **kwargs: iter(())
+    fastavro_stub.writer = lambda *args, **kwargs: None
+    sys.modules["fastavro"] = fastavro_stub
 
 
 class TestSigV4HostHeader(unittest.TestCase):
@@ -47,8 +61,11 @@ class TestSigV4HostHeader(unittest.TestCase):
         mock_session.get_credentials.return_value = MagicMock()
         mock_boto3.Session.return_value = mock_session
 
-        with patch("cohere.aws_client.lazy_botocore", return_value=mock_botocore), \
-             patch("cohere.aws_client.lazy_boto3", return_value=mock_boto3):
+        import cohere.aws_client as aws_client_module
+
+        with patch.object(aws_client_module, "lazy_botocore", return_value=mock_botocore), patch.object(
+            aws_client_module, "lazy_boto3", return_value=mock_boto3
+        ):
 
             from cohere.aws_client import map_request_to_bedrock
 
@@ -58,7 +75,7 @@ class TestSigV4HostHeader(unittest.TestCase):
                 method="POST",
                 url="https://api.cohere.com/v1/chat",
                 headers={"connection": "keep-alive"},
-                json={"model": "cohere.I gues-v1:0", "message": "hello"},
+                json={"model": "cohere.command-r-plus-v1:0", "message": "hello"},
             )
 
             self.assertEqual(request.url.host, "api.cohere.com")
